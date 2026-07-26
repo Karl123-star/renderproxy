@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: folio-proxy
+    env: node
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: PIXELDRAIN_KEY
+        value: afb4958f-48c2-44d8-91d2-0922195ed0c1
