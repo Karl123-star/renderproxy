@@ -6,4 +6,4 @@ services:
     startCommand: node server.js
     envVars:
       - key: PIXELDRAIN_KEY
-        value: afb4958f-48c2-44d8-91d2-0922195ed0c1
+        value: f6d13e61-9fb2-4a55-818e-57346d848afa
