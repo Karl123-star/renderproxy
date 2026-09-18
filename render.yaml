@@ -6,4 +6,6 @@ services:
     startCommand: node server.js
     envVars:
       - key: PIXELDRAIN_KEY
-        value: 11e5a07e-366f-44aa-a207-1ab3cf7241ed
+        sync: false
+      - key: PUBLIC_BASE_URL
+        value: https://renderproxy-9q2i.onrender.com
