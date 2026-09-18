@@ -9,8 +9,7 @@ const upload = multer({
 });
 
 const PORT = process.env.PORT || 3000;
-const PD_KEY = process.env.PIXELDRAIN_KEY || "";
-
+const PIXELDRAIN_KEY = (process.env.PIXELDRAIN_KEY || "").trim();
 const PUBLIC_BASE_URL = (
   process.env.PUBLIC_BASE_URL ||
   `https://${process.env.RENDER_EXTERNAL_HOSTNAME || ""}`
@@ -19,7 +18,13 @@ const PUBLIC_BASE_URL = (
 app.use(cors({
   origin: "*",
   methods: ["GET", "POST", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Origin", "Content-Type", "Accept", "Authorization", "Range"],
+  allowedHeaders: [
+    "Origin",
+    "Content-Type",
+    "Accept",
+    "Authorization",
+    "Range"
+  ],
   exposedHeaders: [
     "Content-Length",
     "Content-Range",
@@ -33,11 +38,11 @@ app.options("*", cors());
 app.use(express.json());
 
 function pixeldrainAuth() {
-  return `Basic ${Buffer.from(`:${PD_KEY}`).toString("base64")}`;
+  return `Basic ${Buffer.from(`:${PIXELDRAIN_KEY}`).toString("base64")}`;
 }
 
 function requirePixeldrainKey(res) {
-  if (!PD_KEY) {
+  if (!PIXELDRAIN_KEY) {
     res.status(500).json({
       success: false,
       error: "PIXELDRAIN_KEY is not configured on the server."
@@ -52,17 +57,30 @@ function getProxyUrl(fileId) {
   return `${PUBLIC_BASE_URL}/stream/${encodeURIComponent(fileId)}`;
 }
 
+function getPixeldrainError(response) {
+  const data = response?.data;
+
+  if (data && typeof data.on === "function") {
+    return `Pixeldrain returned HTTP ${response.status}. Check the Render logs and Pixeldrain API key.`;
+  }
+
+  if (typeof data === "string") return data.slice(0, 300);
+  if (data?.message) return data.message;
+  if (data?.error) return data.error;
+
+  return `Pixeldrain returned HTTP ${response?.status || "an error"}.`;
+}
+
 app.get("/", (_req, res) => {
   res.json({
     status: "Wohoo Cloud Proxy running",
-    pixeldrain: PD_KEY ? "configured" : "missing key",
+    pixeldrain: PIXELDRAIN_KEY ? "configured" : "missing key",
     publicUrl: PUBLIC_BASE_URL || "missing PUBLIC_BASE_URL"
   });
 });
 
 // Upload a file to Pixeldrain.
-// POST /upload
-// Multipart field: file
+// POST /upload with multipart field: file
 app.post("/upload", upload.single("file"), async (req, res) => {
   if (!requirePixeldrainKey(res)) return;
 
@@ -75,7 +93,6 @@ app.post("/upload", upload.single("file"), async (req, res) => {
 
   try {
     const encodedFilename = encodeURIComponent(req.file.originalname);
-
     const response = await axios.put(
       `https://pixeldrain.com/api/file/${encodedFilename}`,
       req.file.buffer,
@@ -92,7 +109,6 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     );
 
     const fileId = response.data?.id;
-
     if (!fileId) {
       return res.status(502).json({
         success: false,
@@ -102,26 +118,22 @@ app.post("/upload", upload.single("file"), async (req, res) => {
 
     const proxyUrl = getProxyUrl(fileId);
 
-    res.status(201).json({
+    return res.status(201).json({
       success: true,
       id: fileId,
-
-      // This is the URL that must be saved by the web app.
-      // It points to Render, not directly to Pixeldrain.
       url: proxyUrl,
       streamUrl: proxyUrl,
-
       name: req.file.originalname,
       fileName: req.file.originalname,
       size: req.file.size,
-      mimeType: req.file.mimetype || "application/octet-stream",
-
-      // Kept for server-side debugging only.
-      // The frontend should not use this URL.
-      viewUrl: `https://pixeldrain.com/u/${fileId}`
+      mimeType: req.file.mimetype || "application/octet-stream"
     });
   } catch (error) {
-    console.error("Pixeldrain upload error:", error.response?.data || error.message);
+    console.error(
+      "Pixeldrain upload error:",
+      error.response?.status,
+      error.response?.data || error.message
+    );
 
     const status = error.response?.status || 500;
     const message =
@@ -130,7 +142,7 @@ app.post("/upload", upload.single("file"), async (req, res) => {
       error.message ||
       "Upload failed.";
 
-    res.status(status).json({
+    return res.status(status).json({
       success: false,
       error: message
     });
@@ -143,17 +155,15 @@ app.get("/stream/:id", async (req, res) => {
   if (!requirePixeldrainKey(res)) return;
 
   const fileId = decodeURIComponent(req.params.id);
+  const requestHeaders = {
+    Authorization: pixeldrainAuth()
+  };
+
+  if (req.headers.range) {
+    requestHeaders.Range = req.headers.range;
+  }
 
   try {
-    const requestHeaders = {
-      Authorization: pixeldrainAuth()
-    };
-
-    // Forward range requests for video playback and resumable downloads.
-    if (req.headers.range) {
-      requestHeaders.Range = req.headers.range;
-    }
-
     const response = await axios.get(
       `https://pixeldrain.com/api/file/${encodeURIComponent(fileId)}`,
       {
@@ -168,17 +178,19 @@ app.get("/stream/:id", async (req, res) => {
       console.error(
         "Pixeldrain download error:",
         response.status,
-        response.data
+        response.statusText,
+        response.headers
       );
 
-      if (!res.headersSent) {
-        return res.status(response.status).json({
-          success: false,
-          error: "Pixeldrain could not provide this file."
-        });
+      // Do not pipe an error response body to the browser.
+      if (response.data && typeof response.data.destroy === "function") {
+        response.data.destroy();
       }
 
-      return res.end();
+      return res.status(response.status).json({
+        success: false,
+        error: getPixeldrainError(response)
+      });
     }
 
     const contentType =
@@ -190,6 +202,11 @@ app.get("/stream/:id", async (req, res) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Range, Content-Type");
+    res.setHeader("Content-Disposition", "inline");
+    res.setHeader(
+      "Accept-Ranges",
+      response.headers["accept-ranges"] || "bytes"
+    );
 
     if (response.headers["content-length"]) {
       res.setHeader("Content-Length", response.headers["content-length"]);
@@ -199,18 +216,8 @@ app.get("/stream/:id", async (req, res) => {
       res.setHeader("Content-Range", response.headers["content-range"]);
     }
 
-    res.setHeader(
-      "Accept-Ranges",
-      response.headers["accept-ranges"] || "bytes"
-    );
-
-    // The frontend fetches the file and creates its own download.
-    // Keep this response inline so the browser does not navigate away.
-    res.setHeader("Content-Disposition", "inline");
-
     response.data.on("error", error => {
       console.error("Pixeldrain stream error:", error.message);
-
       if (!res.headersSent) {
         res.status(502).json({
           success: false,
@@ -221,16 +228,18 @@ app.get("/stream/:id", async (req, res) => {
       }
     });
 
-    response.data.pipe(res);
+    return response.data.pipe(res);
   } catch (error) {
     console.error("Proxy download error:", error.message);
 
     if (!res.headersSent) {
-      res.status(500).json({
+      return res.status(500).json({
         success: false,
         error: "Could not download the file through the proxy."
       });
     }
+
+    return res.end();
   }
 });
 
@@ -252,15 +261,16 @@ app.delete("/file/:id", async (req, res) => {
       }
     );
 
-    res.json({
-      success: true
-    });
+    return res.json({ success: true });
   } catch (error) {
-    console.error("Pixeldrain delete error:", error.response?.data || error.message);
+    console.error(
+      "Pixeldrain delete error:",
+      error.response?.status,
+      error.response?.data || error.message
+    );
 
     const status = error.response?.status || 500;
-
-    res.status(status).json({
+    return res.status(status).json({
       success: false,
       error:
         error.response?.data?.message ||
@@ -273,7 +283,6 @@ app.delete("/file/:id", async (req, res) => {
 
 app.use((error, _req, res, _next) => {
   console.error("Server error:", error);
-
   res.status(500).json({
     success: false,
     error: "Internal server error."
